@@ -103,14 +103,30 @@ class RLHFDataset(Dataset):
 
         print(f'original dataset len: {len(self.dataframe)}')
 
-        # filter out too long prompts
-        tokenizer = self.tokenizer
-        prompt_key = self.prompt_key
+        # Filter prompts longer than max_prompt_length (same tokenization as __getitem__ /
+        # tokenize_and_postprocess_data: raw string + add_special_tokens=False).
+        if self.filter_prompts:
+            tokenizer = self.tokenizer
+            prompt_key = self.prompt_key
+            max_len = self.max_prompt_length
 
-        # nvm if prompt is too long
-        # self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
-        #     tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
-        #                                                      axis=1)]
+            def _prompt_fits(row) -> bool:
+                chat = row[prompt_key]
+                if hasattr(chat, 'tolist'):
+                    chat = chat.tolist()
+                if not isinstance(chat, list) or len(chat) == 0:
+                    return False
+                first = chat[0]
+                if not isinstance(first, dict) or 'content' not in first:
+                    return False
+                prompt_str = first['content']
+                n = len(tokenizer(prompt_str, add_special_tokens=False)['input_ids'])
+                return n <= max_len
+
+            mask = self.dataframe.apply(_prompt_fits, axis=1)
+            before = len(self.dataframe)
+            self.dataframe = self.dataframe[mask].reset_index(drop=True)
+            print(f'filter_prompts: kept {len(self.dataframe)}/{before} rows (max_prompt_length={max_len})')
 
         print(f'filter dataset len: {len(self.dataframe)}')
 
