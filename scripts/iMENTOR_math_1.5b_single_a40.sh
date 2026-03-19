@@ -11,7 +11,7 @@ python3 -m verl.trainer.main_iMENTOR \
     data.val_files=$DIR/data/math/test.parquet \
     data.train_batch_size=64 \
     data.val_batch_size=64 \
-    data.max_prompt_length=256 \
+    data.max_prompt_length=512 \
     data.max_response_length=512 \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-1.5B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
