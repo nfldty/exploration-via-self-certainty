@@ -60,7 +60,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     data_source = 'math'
-    dataset = datasets.load_dataset('hendrycks/competition_math')
+    dataset = datasets.load_dataset('qwedsacf/competition_math')
 
     train_dataset = dataset['train']
     test_dataset = dataset['test']
