@@ -16,6 +16,7 @@ Single Process Actor
 """
 
 import itertools
+import math
 from typing import Iterable, Tuple
 
 import torch
@@ -55,11 +56,22 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _compute_self_certainty(logits):
+        """Compute per-token self-certainty: KL(Uniform || p) for each position.
+
+        Uses the identity KL(U || p) = logsumexp(z) - log|V| - mean(z)
+        which avoids materializing the full softmax distribution.
+        """
+        vocab_size = logits.shape[-1]
+        return torch.logsumexp(logits, dim=-1) - math.log(vocab_size) - logits.mean(dim=-1)
+
+    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns: 
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            self_certainty: # (bs, response_len)
         """
         response_length = micro_batch['responses'].size(-1)
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -102,6 +114,9 @@ class DataParallelPPOActor(BasePPOActor):
                 # compute entropy
                 entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
+                # compute self-certainty: KL(Uniform || p) per token
+                sc_rmpad = self._compute_self_certainty(logits_rmpad)
+
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
 
@@ -113,6 +128,10 @@ class DataParallelPPOActor(BasePPOActor):
                                                             gather_dim=0,
                                                             unpad_dim=0,
                                                             padding_size=pad_size)
+                    sc_rmpad = gather_outpus_and_unpad(sc_rmpad,
+                                                       gather_dim=0,
+                                                       unpad_dim=0,
+                                                       padding_size=pad_size)
                 # pad back to (bsz, seqlen)
                 full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
                                          indices=indices,
@@ -122,10 +141,15 @@ class DataParallelPPOActor(BasePPOActor):
                                            indices=indices,
                                            batch=batch_size,
                                            seqlen=seqlen)
+                full_sc = pad_input(hidden_states=sc_rmpad.unsqueeze(-1),
+                                    indices=indices,
+                                    batch=batch_size,
+                                    seqlen=seqlen)
 
                 # only return response part:
                 entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                self_certainty = full_sc.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
                 output = self.actor_module(input_ids=input_ids,
@@ -137,8 +161,9 @@ class DataParallelPPOActor(BasePPOActor):
                 logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                self_certainty = self._compute_self_certainty(logits)  # (bsz, response_length)
 
-            return entropy, log_probs
+            return entropy, log_probs, self_certainty
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -150,7 +175,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.step()
         return grad_norm
 
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, return_self_certainty=False):
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -165,8 +190,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
+            return_self_certainty: if True, also return per-token self-certainty scores.
+
         Returns:
-            torch.Tensor: the log_prob tensor
+            torch.Tensor or Tuple[torch.Tensor, torch.Tensor]: log_probs, and optionally self_certainty
         """
         # set to eval
         self.actor_module.eval()
@@ -186,18 +213,27 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches = batch.split(micro_batch_size)
 
         log_probs_lst = []
+        sc_lst = [] if return_self_certainty else None
         for micro_batch in micro_batches:
             with torch.no_grad():
-                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
+                _, log_probs, sc = self._forward_micro_batch(micro_batch, temperature=temperature)
             log_probs_lst.append(log_probs)
+            if return_self_certainty:
+                sc_lst.append(sc)
         log_probs = torch.concat(log_probs_lst, dim=0)
+        if return_self_certainty:
+            self_certainty = torch.concat(sc_lst, dim=0)
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
+            if return_self_certainty:
+                self_certainty = self_certainty[revert_indices]
 
+        if return_self_certainty:
+            return log_probs, self_certainty
         return log_probs
 
     def update_policy(self, data: DataProto):
@@ -243,7 +279,7 @@ class DataParallelPPOActor(BasePPOActor):
                 entropy_coeff = self.config.entropy_coeff
 
                 # all return: (bsz, response_length)
-                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                entropy, log_prob, _ = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                               log_prob=log_prob,

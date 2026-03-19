@@ -164,3 +164,6 @@ imentor:
   lr: 0.001
   scales: [40.0, 40.0, 1.0]
 
+self_certainty:
+  scales: [0.05, 1.0, 0.1]  # [numerator_scale, denominator_scale, decay_increment]
+

@@ -428,11 +428,13 @@ class ActorRolloutRefWorker(Worker):
             output.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
             output.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
             output.meta_info['temperature'] = self.config.rollout.temperature
-            # perform recompute log_prob
+            # perform recompute log_prob and self-certainty
             with self.ulysses_sharding_manager:
                 output = self.ulysses_sharding_manager.preprocess_data(output)
-                old_log_probs = self.actor.compute_log_prob(data=output)
+                old_log_probs, self_certainty = self.actor.compute_log_prob(
+                    data=output, return_self_certainty=True)
                 output.batch['old_log_probs'] = old_log_probs
+                output.batch['self_certainty'] = self_certainty
                 output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')

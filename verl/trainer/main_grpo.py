@@ -2,7 +2,7 @@ from verl import DataProto
 import torch
 from torch import nn
 import ray
-from verl.utils.reward_score import gsm8k, countdown
+from verl.utils.reward_score import gsm8k, countdown, math_dataset
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 
@@ -11,8 +11,10 @@ def _select_rm_score_fn(data_source):
         return gsm8k.compute_score
     elif "countdown" in data_source:
         return countdown.compute_score
+    elif data_source == 'math':
+        return math_dataset.compute_score
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unknown data_source: {data_source}")
 
 
 
