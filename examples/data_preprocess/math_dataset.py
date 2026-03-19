@@ -62,8 +62,16 @@ if __name__ == '__main__':
     data_source = 'math'
     dataset = datasets.load_dataset('qwedsacf/competition_math')
 
-    train_dataset = dataset['train']
-    test_dataset = dataset['test']
+    # Some mirrors only provide a single 'train' split.
+    if 'test' in dataset:
+        train_dataset = dataset['train']
+        test_dataset = dataset['test']
+    else:
+        full_train = dataset['train']
+        # Build a deterministic train/test split from the single split.
+        split = full_train.train_test_split(test_size=max(200, args.test_size), seed=42, shuffle=True)
+        train_dataset = split['train']
+        test_dataset = split['test']
 
     if args.train_size is not None and args.train_size < len(train_dataset):
         train_dataset = train_dataset.select(range(args.train_size))
