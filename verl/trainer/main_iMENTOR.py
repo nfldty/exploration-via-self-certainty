@@ -1,4 +1,5 @@
 from verl import DataProto
+import math
 import torch
 import ray
 from verl.utils.reward_score import gsm8k, countdown, math_dataset
@@ -29,6 +30,10 @@ class RewardManager():
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.scales = list(scales)
+        # Running statistics for z-score normalization (Welford's algorithm)
+        self._sc_count = 0
+        self._sc_mean = 0.0
+        self._sc_m2 = 0.0
 
     def __call__(self, data: DataProto):
         if 'rm_scores' in data.batch.keys():
@@ -66,13 +71,26 @@ class RewardManager():
                 solution_str=sequences_str, ground_truth=ground_truth)
             reward_tensor[i, valid_response_length - 1] = score
 
-            # Self-certainty intrinsic reward: only for incorrect answers
+            # Self-certainty intrinsic reward: only for incorrect answers.
+            # Normalize via z-score → sigmoid to bound output in [0, 0.5]:
+            #   z = (SC - μ) / σ,   r = 0.5 · sigmoid(z)
             if score < 1.0 and self_certainty is not None:
                 sc_tokens = self_certainty[i, :valid_response_length]
-                # Average self-certainty over response tokens (Eq. 2 in paper)
                 avg_sc = sc_tokens.mean().item()
+
+                # Update running mean and variance (Welford's online algorithm)
+                self._sc_count += 1
+                delta = avg_sc - self._sc_mean
+                self._sc_mean += delta / self._sc_count
+                delta2 = avg_sc - self._sc_mean
+                self._sc_m2 += delta * delta2
+
+                std = math.sqrt(self._sc_m2 / self._sc_count) if self._sc_count > 1 else 1.0
+                z = (avg_sc - self._sc_mean) / max(std, 1e-8)
+                avg_sc_norm = 0.5 * (1.0 / (1.0 + math.exp(-z)))  # 0.5 · σ(z)
+
                 intrinsic_reward_tensor[i, valid_response_length - 1] = (
-                    avg_sc * self.scales[0] / self.scales[1])
+                    avg_sc_norm * self.scales[0] / self.scales[1])
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
