@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Type, Dict
+from typing import Type, Dict, Optional
 from collections import defaultdict
 import numpy as np
 from codetiming import Timer
@@ -516,16 +516,20 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
-    def _save_checkpoint(self):
-        actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
-                                        f'global_step_{self.global_steps}')
+    def _save_checkpoint(self, global_step_override: Optional[int] = None, dirname: Optional[str] = None):
+        """Save actor (and critic if used). Use dirname='final' for end-of-run checkpoint."""
+        if dirname is not None:
+            ckpt_name = dirname
+        else:
+            step = self.global_steps if global_step_override is None else global_step_override
+            ckpt_name = f'global_step_{step}'
+        actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor', ckpt_name)
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, 'actor')
         self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
 
         if self.use_critic:
-            critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
-                                             f'global_step_{self.global_steps}')
+            critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic', ckpt_name)
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
                 self.config.trainer.default_hdfs_dir, 'critic')
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
@@ -690,4 +694,7 @@ class RayPPOTrainer(object):
                         val_metrics = self._validate()
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
+                    # Always persist final actor (and critic if used) after training completes.
+                    pprint('Saving final checkpoint to .../actor/final ...')
+                    self._save_checkpoint(dirname='final')
                     return
