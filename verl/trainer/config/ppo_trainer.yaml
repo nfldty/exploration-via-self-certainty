@@ -158,6 +158,9 @@ trainer:
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
 
+intrinsic_reward:
+  type: self_certainty  # 'rnd', 'self_certainty', or 'none'
+
 imentor:
   embedding: [151936, 16]
   layers: [16, 8]

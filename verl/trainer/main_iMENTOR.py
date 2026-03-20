@@ -1,6 +1,7 @@
 from verl import DataProto
 import math
 import torch
+from torch import nn
 import ray
 from verl.utils.reward_score import gsm8k, countdown, math_dataset
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -17,20 +18,94 @@ def _select_rm_score_fn(data_source):
         raise NotImplementedError(f"Unknown data_source: {data_source}")
 
 
-class RewardManager():
-    """Reward manager using self-certainty as intrinsic reward for incorrect answers.
+# ---------------------------------------------------------------------------
+# RND network components (original iMENTOR intrinsic reward)
+# ---------------------------------------------------------------------------
 
-    Self-certainty(o|q) = (1/|o|) * Σ_i KL(U || p_π(·|q, o_{<i}))
-    is computed from the policy's logits during the forward pass and stored
-    in the batch as 'self_certainty'. Higher values mean the model is more
-    confident (distribution further from uniform).
+class RNDNet(nn.Module):
+    def __init__(self, input_size, layers):
+        super().__init__()
+        self.input_size = input_size
+        self.fn = nn.ModuleList([])
+        self.layers = layers
+        j = self.input_size
+        for i in self.layers:
+            self.fn.append(nn.Linear(j, i))
+            self.fn.append(nn.LeakyReLU())
+            j = i
+        self.fn.append(nn.Linear(self.layers[-1], 1))
+        self.fn.append(nn.Sigmoid())
+
+    def forward(self, x):
+        for func in self.fn:
+            x = func(x)
+        return x
+
+
+class RNDReward(nn.Module):
+    def __init__(self, input_size, layers, embedding):
+        super().__init__()
+        self.emb = nn.Embedding(embedding[0], embedding[1])
+        self.input_size = input_size * embedding[1]
+        self.target = RNDNet(self.input_size, layers)
+        self.predictor = RNDNet(self.input_size, layers)
+        self.bn0 = nn.BatchNorm1d(self.input_size)
+
+    def forward(self, x):
+        x = self.emb(x).view(-1, self.input_size)
+        x = self.bn0(x)
+        x_p = self.predictor(x)
+        with torch.no_grad():
+            x_t = self.target(x)
+        x = ((x_t - x_p) ** 2)
+        with torch.no_grad():
+            x_min = x.min()
+            x_max = x.max()
+            x1 = 0.5 * (x - x_min) / (x_max - x_min)
+        return x, x1
+
+
+@ray.remote(num_gpus=1)
+class RNDActor:
+    def __init__(self, seq_len, layers, embedding, lr):
+        self.device = torch.device("cuda:0")
+        self.rnd_reward = RNDReward(seq_len, layers, embedding).to(self.device)
+        self.rnd_optimizer = torch.optim.AdamW(self.rnd_reward.parameters(), lr=lr)
+
+    def train_one_batch(self, rnd_inputs):
+        rnd_0, rnd_1 = self.rnd_reward(rnd_inputs.to(self.device))
+        rnd_1 = rnd_1.detach().cpu()
+        loss_rnd = rnd_0.mean()
+        self.rnd_optimizer.zero_grad()
+        loss_rnd.backward()
+        self.rnd_optimizer.step()
+        return rnd_1
+
+
+# ---------------------------------------------------------------------------
+# Unified RewardManager with selectable intrinsic reward
+# ---------------------------------------------------------------------------
+
+class RewardManager():
+    """Reward manager with configurable intrinsic reward type.
+
+    Supported intrinsic_reward_type values:
+      - 'self_certainty': z-score → sigmoid normalized self-certainty
+      - 'rnd': Random Network Distillation (original iMENTOR)
+      - 'none': no intrinsic reward (extrinsic only)
     """
 
-    def __init__(self, tokenizer, num_examine, scales) -> None:
+    def __init__(self, tokenizer, num_examine, intrinsic_reward_type, scales,
+                 rnd_trainer=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
+        self.intrinsic_reward_type = intrinsic_reward_type
         self.scales = list(scales)
-        # Running statistics for z-score normalization (Welford's algorithm)
+
+        # RND-specific
+        self.rnd_trainer = rnd_trainer
+
+        # Self-certainty running statistics (Welford's algorithm)
         self._sc_count = 0
         self._sc_mean = 0.0
         self._sc_m2 = 0.0
@@ -44,7 +119,13 @@ class RewardManager():
 
         already_print_data_sources = {}
 
-        # per-token self-certainty computed during actor's log-prob forward pass
+        # ---- RND: batch-level forward pass ----
+        rnd_per_sample = None
+        if self.intrinsic_reward_type == 'rnd' and self.rnd_trainer is not None:
+            rnd_inputs = data.batch["input_ids"] * data.batch["attention_mask"]
+            rnd_per_sample = ray.get(self.rnd_trainer.train_one_batch.remote(rnd_inputs))
+
+        # ---- Self-certainty: retrieve per-token values ----
         self_certainty = data.batch.get('self_certainty', None)
 
         for i in range(len(data)):
@@ -71,26 +152,30 @@ class RewardManager():
                 solution_str=sequences_str, ground_truth=ground_truth)
             reward_tensor[i, valid_response_length - 1] = score
 
-            # Self-certainty intrinsic reward: only for incorrect answers.
-            # Normalize via z-score → sigmoid to bound output in [0, 0.5]:
-            #   z = (SC - μ) / σ,   r = 0.5 · sigmoid(z)
-            if score < 1.0 and self_certainty is not None:
-                sc_tokens = self_certainty[i, :valid_response_length]
-                avg_sc = sc_tokens.mean().item()
+            # Intrinsic reward (only for incorrect answers)
+            if score < 1.0:
+                if self.intrinsic_reward_type == 'rnd' and rnd_per_sample is not None:
+                    intrinsic_reward_tensor[i, valid_response_length - 1] = (
+                        rnd_per_sample[i] * self.scales[0] / self.scales[1])
 
-                # Update running mean and variance (Welford's online algorithm)
-                self._sc_count += 1
-                delta = avg_sc - self._sc_mean
-                self._sc_mean += delta / self._sc_count
-                delta2 = avg_sc - self._sc_mean
-                self._sc_m2 += delta * delta2
+                elif self.intrinsic_reward_type == 'self_certainty' and self_certainty is not None:
+                    sc_tokens = self_certainty[i, :valid_response_length]
+                    avg_sc = sc_tokens.mean().item()
 
-                std = math.sqrt(self._sc_m2 / self._sc_count) if self._sc_count > 1 else 1.0
-                z = (avg_sc - self._sc_mean) / max(std, 1e-8)
-                avg_sc_norm = 0.5 * (1.0 / (1.0 + math.exp(-z)))  # 0.5 · σ(z)
+                    self._sc_count += 1
+                    delta = avg_sc - self._sc_mean
+                    self._sc_mean += delta / self._sc_count
+                    delta2 = avg_sc - self._sc_mean
+                    self._sc_m2 += delta * delta2
 
-                intrinsic_reward_tensor[i, valid_response_length - 1] = (
-                    avg_sc_norm * self.scales[0] / self.scales[1])
+                    std = math.sqrt(self._sc_m2 / self._sc_count) if self._sc_count > 1 else 1.0
+                    z = (avg_sc - self._sc_mean) / max(std, 1e-8)
+                    avg_sc_norm = 0.5 * (1.0 / (1.0 + math.exp(-z)))
+
+                    intrinsic_reward_tensor[i, valid_response_length - 1] = (
+                        avg_sc_norm * self.scales[0] / self.scales[1])
+
+                # 'none': intrinsic_reward_tensor stays zero
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -219,10 +304,32 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
+    # --- Select intrinsic reward type ---
+    intrinsic_type = config.intrinsic_reward.type
+    assert intrinsic_type in ('rnd', 'self_certainty', 'none'), \
+        f"intrinsic_reward.type must be 'rnd', 'self_certainty', or 'none', got '{intrinsic_type}'"
+
+    rnd_trainer = None
+    if intrinsic_type == 'rnd':
+        rnd_trainer = RNDActor.remote(
+            seq_len=config.data.max_prompt_length + config.data.max_response_length,
+            layers=config.imentor.layers,
+            embedding=config.imentor.embedding,
+            lr=config.imentor.lr)
+
+    if intrinsic_type == 'self_certainty':
+        scales = list(config.self_certainty.scales)
+    elif intrinsic_type == 'rnd':
+        scales = list(config.imentor.scales)
+    else:
+        scales = [0.0, 1.0, 0.0]
+
     reward_fn = RewardManager(
         tokenizer=tokenizer,
         num_examine=1,
-        scales=config.self_certainty.scales)
+        intrinsic_reward_type=intrinsic_type,
+        scales=scales,
+        rnd_trainer=rnd_trainer)
 
     val_reward_fn = ValRewardManager(tokenizer=tokenizer, num_examine=1)
 
