@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import shutil
 import warnings
 
 import torch
@@ -498,7 +499,11 @@ class ActorRolloutRefWorker(Worker):
             self.tokenizer.save_pretrained(local_path)
             if hdfs_path is not None:
                 print(f'Uploading actor checkpoint to {hdfs_path}')
-                hdfs_io.makedirs(hdfs_path, exist_ok=True)
+                # Local copy uses shutil.copytree, which requires dst to not exist.
+                if not hdfs_path.startswith('hdfs'):
+                    _dst = os.path.expanduser(hdfs_path)
+                    if os.path.isdir(_dst):
+                        shutil.rmtree(_dst)
                 hdfs_io.copy(src=local_path, dst=hdfs_path)
 
         torch.distributed.barrier()
@@ -755,7 +760,10 @@ class CriticWorker(Worker):
             self.tokenizer.save_pretrained(local_path)
             if hdfs_path is not None:
                 print(f'Uploading critic checkpoint to {hdfs_path}')
-                hdfs_io.makedirs(hdfs_path, exist_ok=True)
+                if not hdfs_path.startswith('hdfs'):
+                    _dst = os.path.expanduser(hdfs_path)
+                    if os.path.isdir(_dst):
+                        shutil.rmtree(_dst)
                 hdfs_io.copy(src=local_path, dst=hdfs_path)
 
         torch.distributed.barrier()

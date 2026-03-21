@@ -524,14 +524,15 @@ class RayPPOTrainer(object):
             step = self.global_steps if global_step_override is None else global_step_override
             ckpt_name = f'global_step_{step}'
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor', ckpt_name)
+        # Mirror local layout: .../actor/<ckpt_name> so copytree dst is unique per save (avoids FileExistsError on rerun).
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
-            self.config.trainer.default_hdfs_dir, 'actor')
+            self.config.trainer.default_hdfs_dir, 'actor', ckpt_name)
         self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
 
         if self.use_critic:
             critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic', ckpt_name)
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
-                self.config.trainer.default_hdfs_dir, 'critic')
+                self.config.trainer.default_hdfs_dir, 'critic', ckpt_name)
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
