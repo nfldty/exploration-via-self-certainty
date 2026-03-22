@@ -169,7 +169,8 @@ class RewardManager():
                     self._sc_m2 += delta * delta2
 
                     std = math.sqrt(self._sc_m2 / self._sc_count) if self._sc_count > 1 else 1.0
-                    z = (avg_sc - self._sc_mean) / max(std, 1e-8)
+                    # Negate: low self-certainty (more exploration) → large positive z → larger reward
+                    z = (self._sc_mean - avg_sc) / max(std, 1e-8)
                     avg_sc_norm = 0.5 * (1.0 / (1.0 + math.exp(-z)))
 
                     intrinsic_reward_tensor[i, valid_response_length - 1] = (
