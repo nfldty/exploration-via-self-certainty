@@ -152,8 +152,8 @@ class RewardManager():
                 solution_str=sequences_str, ground_truth=ground_truth)
             reward_tensor[i, valid_response_length - 1] = score
 
-            # Intrinsic reward (only for incorrect answers)
-            if score < 1.0:
+            # Intrinsic reward (only for formatted-but-wrong answers; skip gibberish)
+            if 0.0 < score < 1.0:
                 if self.intrinsic_reward_type == 'rnd' and rnd_per_sample is not None:
                     intrinsic_reward_tensor[i, valid_response_length - 1] = (
                         rnd_per_sample[i] * self.scales[0] / self.scales[1])
