@@ -94,14 +94,22 @@ def compute_score(solution_str, ground_truth, method='strict', error_score=0.0, 
     """Scoring function for MATH dataset.
 
     Args:
-        solution_str: the full solution text from the model
+        solution_str: the full solution text from the model (prompt + response)
         ground_truth: the ground truth answer string (extracted from \\boxed{} in the dataset)
         method: extraction method (unused, kept for interface compatibility)
         error_score: score when no answer is found
         format_score: score when answer is found but incorrect
         score: score when answer is correct
     """
-    pred_answer = extract_solution(solution_str)
+    # Only search the assistant's response, not the prompt (which contains \boxed{}).
+    assistant_marker = '<|im_start|>assistant'
+    marker_pos = solution_str.rfind(assistant_marker)
+    if marker_pos != -1:
+        response_str = solution_str[marker_pos + len(assistant_marker):]
+    else:
+        response_str = solution_str
+
+    pred_answer = extract_solution(response_str)
     if pred_answer is None:
         return error_score
     if _answers_match(pred_answer, ground_truth):
