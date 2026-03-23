@@ -42,7 +42,13 @@ class Tracking(object):
             WANDB_API_KEY = os.environ.get("WANDB_API_KEY", None)
             if WANDB_API_KEY:
                 wandb.login(key=WANDB_API_KEY)
-            wandb.init(project=project_name, name=experiment_name, config=config)
+            # Support resuming a previous W&B run via WANDB_RUN_ID env var.
+            wandb_run_id = os.environ.get("WANDB_RUN_ID", None)
+            if wandb_run_id:
+                wandb.init(project=project_name, name=experiment_name, config=config,
+                           id=wandb_run_id, resume="allow")
+            else:
+                wandb.init(project=project_name, name=experiment_name, config=config)
             self.logger['wandb'] = wandb
 
         if 'mlflow' in default_backend:
